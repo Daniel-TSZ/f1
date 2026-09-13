@@ -25,5 +25,18 @@ app.use('/admin', adminRoutes);
 app.use('/me', meRoutes);
 app.use('/public', publicRoutes);
 
+// Глобальный обработчик ошибок — сервер не падает от одиночной ошибки
+app.use((err: any, _req: any, res: any, _next: any) => {
+  console.error('Unhandled error:', err);
+  res.status(500).json({ error: 'Внутренняя ошибка' });
+});
+
+process.on('unhandledRejection', (reason) => {
+  console.error('Unhandled rejection:', reason);
+});
+process.on('uncaughtException', (err) => {
+  console.error('Uncaught exception:', err);
+});
+
 const port = Number(process.env.PORT) || 3000;
 app.listen(port, () => console.log(`Server running on port ${port}`));
