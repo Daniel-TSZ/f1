@@ -4,18 +4,28 @@ import { requireUser, AuthRequest } from '../middleware/auth';
 
 const router = Router();
 
+function positionName(p: string): string {
+  return {
+    p1: '1 место', p2: '2 место', p3: '3 место',
+    fastest_lap: 'Быстрый круг', pole: 'Поул', best_practice: 'Лучшее время'
+  }[p] || p;
+}
+
 router.get('/my', requireUser, async (req: AuthRequest, res) => {
-  const result = await pool.query(
-    `SELECT b.*, r.name AS race_name, r.type AS race_type,
-            bo.driver
-     FROM bets b
-     JOIN races r ON r.id = b.race_id
-     JOIN bet_options bo ON bo.id = b.bet_option_id
-     WHERE b.user_id = $1
-     ORDER BY b.created_at DESC`,
-    [req.userId]
-  );
-  res.json(result.rows);
+  try {
+    const result = await pool.query(
+      `SELECT b.*, r.name AS race_name, r.type AS race_type, bo.driver
+       FROM bets b
+       JOIN races r ON r.id=b.race_id
+       JOIN bet_options bo ON bo.id=b.bet_option_id
+       WHERE b.user_id=$1
+       ORDER BY b.created_at DESC`,
+      [req.userId]
+    );
+    res.json(result.rows);
+  } catch (e: any) {
+    res.status(500).json({ error: e.message });
+  }
 });
 
 router.post('/', requireUser, async (req: AuthRequest, res) => {
@@ -24,25 +34,26 @@ router.post('/', requireUser, async (req: AuthRequest, res) => {
     return res.status(400).json({ error: 'Неверные данные (минимум 10 монет)' });
   }
 
-  const raceTypeRes = await pool.query('SELECT type FROM races WHERE id=$1', [raceId]);
-  const raceType = raceTypeRes.rows[0]?.type;
-  const allowed: Record<string, string[]> = {
-    race: ['p1', 'p2', 'p3', 'fastest_lap'],
-    quali: ['pole'],
-    practice: ['best_practice']
-  };
-  if (!raceType || !allowed[raceType]?.includes(position)) {
-    return res.status(400).json({ error: 'Эта позиция недоступна для такого события' });
-  }
-
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
+
+    const raceTypeRes = await client.query('SELECT type FROM races WHERE id=$1', [raceId]);
+    const raceType = raceTypeRes.rows[0]?.type;
+    const allowed: Record<string, string[]> = {
+      race: ['p1', 'p2', 'p3', 'fastest_lap'],
+      quali: ['pole'],
+      practice: ['best_practice']
+    };
+    if (!raceType || !allowed[raceType]?.includes(position)) {
+      throw new Error('Эта позиция недоступна для такого события');
+    }
 
     const userRes = await client.query(
       'SELECT coins FROM profiles WHERE id=$1 FOR UPDATE',
       [req.userId]
     );
+    if (!userRes.rows[0]) throw new Error('Пользователь не найден');
     if (userRes.rows[0].coins < amount) throw new Error('Недостаточно монет');
 
     const raceRes = await client.query(
@@ -50,6 +61,7 @@ router.post('/', requireUser, async (req: AuthRequest, res) => {
       [raceId]
     );
     const race = raceRes.rows[0];
+    if (!race) throw new Error('Событие не найдено');
     if (race.status === 'finished') throw new Error('Событие завершено');
     if (race.bet_deadline && new Date(race.bet_deadline) < new Date()) {
       throw new Error('Дедлайн ставок прошёл');
@@ -84,6 +96,7 @@ router.post('/', requireUser, async (req: AuthRequest, res) => {
        VALUES ($1,$2,$3,$4,$5,$6) RETURNING *`,
       [req.userId, raceId, betOptionId, position, amount, payout]
     );
+
     await client.query(
       `INSERT INTO transactions (user_id, amount, type, note)
        VALUES ($1,$2,'bet',$3)`,
@@ -99,13 +112,6 @@ router.post('/', requireUser, async (req: AuthRequest, res) => {
     client.release();
   }
 });
-
-function positionName(p: string): string {
-  return {
-    p1: '1 место', p2: '2 место', p3: '3 место',
-    fastest_lap: 'Быстрый круг', pole: 'Поул', best_practice: 'Лучшее время'
-  }[p] || p;
-}
 
 async function calculateWinnerCoefficient(
   driver: string,
