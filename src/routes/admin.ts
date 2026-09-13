@@ -10,10 +10,8 @@ async function getSetting(key: string, fallback: string): Promise<string> {
 }
 
 router.post('/login', (req, res) => {
-  const { password } = req.body;
-  if (password !== process.env.ADMIN_PASSWORD) {
+  if (req.body.password !== process.env.ADMIN_PASSWORD)
     return res.status(401).json({ error: 'Неверный пароль' });
-  }
   res.json({ ok: true });
 });
 
@@ -21,22 +19,17 @@ router.use(requireAdmin);
 
 // ==================== DASHBOARD ====================
 router.get('/dashboard', async (_req, res) => {
-  const [users, races, bets, coins, pendingPayouts] = await Promise.all([
+  const [users, races, bets, coins, pending] = await Promise.all([
     pool.query('SELECT COUNT(*)::int AS c FROM profiles'),
     pool.query('SELECT COUNT(*)::int AS c FROM races'),
     pool.query('SELECT COUNT(*)::int AS c FROM bets'),
     pool.query('SELECT COALESCE(SUM(coins),0)::int AS c FROM profiles'),
     pool.query(`SELECT COALESCE(SUM(potential_payout),0)::int AS c FROM bets WHERE status='pending'`)
   ]);
-  const top = await pool.query(
-    'SELECT nickname, coins FROM profiles ORDER BY coins DESC LIMIT 5'
-  );
+  const top = await pool.query('SELECT nickname, coins FROM profiles ORDER BY coins DESC LIMIT 5');
   res.json({
-    users: users.rows[0].c,
-    races: races.rows[0].c,
-    bets: bets.rows[0].c,
-    coinsInSystem: coins.rows[0].c,
-    pendingPayouts: pendingPayouts.rows[0].c,
+    users: users.rows[0].c, races: races.rows[0].c, bets: bets.rows[0].c,
+    coinsInSystem: coins.rows[0].c, pendingPayouts: pending.rows[0].c,
     top: top.rows
   });
 });
@@ -72,39 +65,36 @@ router.patch('/settings', async (req, res) => {
   } catch (e: any) {
     await client.query('ROLLBACK');
     res.status(400).json({ error: e.message });
-  } finally {
-    client.release();
-  }
+  } finally { client.release(); }
 });
 
 // ==================== LOGS ====================
 router.get('/logs', async (_req, res) => {
-  const r = await pool.query(
-    'SELECT * FROM admin_log ORDER BY created_at DESC LIMIT 100'
-  );
+  const r = await pool.query('SELECT * FROM admin_log ORDER BY created_at DESC LIMIT 100');
   res.json(r.rows);
 });
 
 // ==================== RACES ====================
 router.post('/races', async (req, res) => {
-  const { name, circuit, raceDate, betDeadline, posterUrl } = req.body;
+  const { name, circuit, raceDate, betDeadline, posterUrl, type } = req.body;
   const r = await pool.query(
-    `INSERT INTO races (name, circuit, race_date, bet_deadline, poster_url)
-     VALUES ($1,$2,$3,$4,$5) RETURNING *`,
-    [name, circuit, raceDate, betDeadline, posterUrl]
+    `INSERT INTO races (name, circuit, race_date, bet_deadline, poster_url, type)
+     VALUES ($1,$2,$3,$4,$5,$6) RETURNING *`,
+    [name, circuit, raceDate, betDeadline, posterUrl, type || 'race']
   );
   res.json(r.rows[0]);
 });
 
 router.patch('/races/:id', async (req, res) => {
-  const { name, circuit, raceDate, betDeadline, posterUrl, status } = req.body;
+  const { name, circuit, raceDate, betDeadline, posterUrl, status, type } = req.body;
   const r = await pool.query(
     `UPDATE races SET
        name=COALESCE($1,name), circuit=COALESCE($2,circuit),
        race_date=COALESCE($3,race_date), bet_deadline=COALESCE($4,bet_deadline),
-       poster_url=COALESCE($5,poster_url), status=COALESCE($6,status)
-     WHERE id=$7 RETURNING *`,
-    [name, circuit, raceDate, betDeadline, posterUrl, status, req.params.id]
+       poster_url=COALESCE($5,poster_url), status=COALESCE($6,status),
+       type=COALESCE($7,type)
+     WHERE id=$8 RETURNING *`,
+    [name, circuit, raceDate, betDeadline, posterUrl, status, type, req.params.id]
   );
   res.json(r.rows[0]);
 });
@@ -116,23 +106,22 @@ router.delete('/races/:id', async (req, res) => {
 
 router.post('/races/:id/duplicate', async (req, res) => {
   const src = await pool.query('SELECT * FROM races WHERE id=$1', [req.params.id]);
-  if (!src.rows[0]) return res.status(404).json({ error: 'Гонка не найдена' });
+  if (!src.rows[0]) return res.status(404).json({ error: 'Не найдено' });
   const r = src.rows[0];
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
     const newRace = await client.query(
-      `INSERT INTO races (name, circuit, race_date, bet_deadline, poster_url, status)
-       VALUES ($1,$2,$3,$4,$5,'upcoming') RETURNING *`,
-      [`${r.name} (копия)`, r.circuit, r.race_date, r.bet_deadline, r.poster_url]
+      `INSERT INTO races (name, circuit, race_date, bet_deadline, poster_url, type, status)
+       VALUES ($1,$2,$3,$4,$5,$6,'upcoming') RETURNING *`,
+      [`${r.name} (копия)`, r.circuit, r.race_date, r.bet_deadline, r.poster_url, r.type]
     );
     const newId = newRace.rows[0].id;
     const opts = await client.query('SELECT * FROM bet_options WHERE race_id=$1', [req.params.id]);
     for (const o of opts.rows) {
       await client.query(
-        `INSERT INTO bet_options (race_id, type, driver, coefficient, is_locked)
-         VALUES ($1,$2,$3,$4,false)`,
-        [newId, o.type, o.driver, o.coefficient]
+        'INSERT INTO bet_options (race_id, driver, is_locked) VALUES ($1,$2,false)',
+        [newId, o.driver]
       );
     }
     await client.query('COMMIT');
@@ -140,78 +129,53 @@ router.post('/races/:id/duplicate', async (req, res) => {
   } catch (e: any) {
     await client.query('ROLLBACK');
     res.status(400).json({ error: e.message });
-  } finally {
-    client.release();
-  }
+  } finally { client.release(); }
 });
 
-// ==================== BET OPTIONS ====================
+// ==================== BET OPTIONS (пилоты) ====================
 router.post('/races/:id/options', async (req, res) => {
-  const { type, driver, coefficient, isLocked } = req.body;
-  let coef = coefficient;
-  if (coef == null && type === 'winner') {
-    coef = await calculateWinnerCoefficient(driver, req.params.id);
-  }
-  if (coef == null) coef = 2;
+  const { driver, isLocked } = req.body;
+  if (!driver) return res.status(400).json({ error: 'Имя пилота пусто' });
   const r = await pool.query(
-    `INSERT INTO bet_options (race_id, type, driver, coefficient, is_locked)
-     VALUES ($1,$2,$3,$4,$5) RETURNING *`,
-    [req.params.id, type, driver, coef, !!isLocked]
+    'INSERT INTO bet_options (race_id, driver, is_locked) VALUES ($1,$2,$3) RETURNING *',
+    [req.params.id, driver, !!isLocked]
   );
   res.json(r.rows[0]);
 });
 
 router.post('/races/:id/options/bulk', async (req, res) => {
-  const { drivers, types } = req.body as { drivers: string[], types: string[] };
-  if (!Array.isArray(drivers) || !drivers.length) {
-    return res.status(400).json({ error: 'Список пилотов пуст' });
-  }
-  if (!Array.isArray(types) || !types.length) {
-    return res.status(400).json({ error: 'Выбери хотя бы один тип' });
-  }
-
-  const defaultCoefs: Record<string, number> = {
-    winner: 10, p2: 5, p3: 2, fastest_lap: 5, quali: 3, practice: 2
-  };
-
+  const { drivers } = req.body as { drivers: string[] };
+  if (!Array.isArray(drivers) || !drivers.length)
+    return res.status(400).json({ error: 'Список пуст' });
   const client = await pool.connect();
   let added = 0;
   try {
     await client.query('BEGIN');
-    for (const type of types) {
-      for (const driver of drivers) {
-        const d = driver.trim();
-        if (!d) continue;
-        let coef = defaultCoefs[type] ?? 2;
-        if (type === 'winner') {
-          coef = await calculateWinnerCoefficient(d, req.params.id, client);
-        }
-        await client.query(
-          `INSERT INTO bet_options (race_id, type, driver, coefficient)
-           VALUES ($1,$2,$3,$4)`,
-          [req.params.id, type, d, coef]
-        );
-        added++;
-      }
+    for (const d of drivers) {
+      const t = String(d).trim();
+      if (!t) continue;
+      await client.query(
+        'INSERT INTO bet_options (race_id, driver) VALUES ($1,$2)',
+        [req.params.id, t]
+      );
+      added++;
     }
     await client.query('COMMIT');
     res.json({ ok: true, added });
   } catch (e: any) {
     await client.query('ROLLBACK');
     res.status(400).json({ error: e.message });
-  } finally {
-    client.release();
-  }
+  } finally { client.release(); }
 });
 
 router.patch('/options/:id', async (req, res) => {
-  const { coefficient, isLocked } = req.body;
+  const { isLocked, driver } = req.body;
   const r = await pool.query(
     `UPDATE bet_options SET
-       coefficient=COALESCE($1,coefficient),
-       is_locked=COALESCE($2,is_locked)
+       is_locked=COALESCE($1,is_locked),
+       driver=COALESCE($2,driver)
      WHERE id=$3 RETURNING *`,
-    [coefficient, isLocked, req.params.id]
+    [isLocked, driver, req.params.id]
   );
   res.json(r.rows[0]);
 });
@@ -222,26 +186,22 @@ router.delete('/options/:id', async (req, res) => {
 });
 
 router.post('/races/:id/options/lock-all', async (req, res) => {
-  const { lock } = req.body;
-  await pool.query('UPDATE bet_options SET is_locked=$1 WHERE race_id=$2', [!!lock, req.params.id]);
+  await pool.query('UPDATE bet_options SET is_locked=$1 WHERE race_id=$2', [!!req.body.lock, req.params.id]);
   res.json({ ok: true });
 });
 
 // ==================== RESULTS ====================
 router.get('/races/:id/results', async (req, res) => {
-  const r = await pool.query(
-    'SELECT * FROM results WHERE race_id=$1 ORDER BY type, position NULLS LAST',
-    [req.params.id]
-  );
+  const r = await pool.query('SELECT * FROM results WHERE race_id=$1', [req.params.id]);
   res.json(r.rows);
 });
 
 router.post('/races/:id/results', async (req, res) => {
-  const { type, driver, position } = req.body;
+  const { position, driver } = req.body;
+  if (!position || !driver) return res.status(400).json({ error: 'Позиция и пилот обязательны' });
   const r = await pool.query(
-    `INSERT INTO results (race_id, type, driver, position)
-     VALUES ($1,$2,$3,$4) RETURNING *`,
-    [req.params.id, type, driver, position ?? null]
+    'INSERT INTO results (race_id, position, driver) VALUES ($1,$2,$3) RETURNING *',
+    [req.params.id, position, driver]
   );
   res.json(r.rows[0]);
 });
@@ -254,12 +214,11 @@ router.delete('/results/:id', async (req, res) => {
 // ==================== BETS ====================
 router.get('/races/:id/bets', async (req, res) => {
   const r = await pool.query(
-    `SELECT b.*, p.nickname, bo.driver, bo.type, bo.coefficient
+    `SELECT b.*, p.nickname, bo.driver
      FROM bets b
      JOIN profiles p ON p.id=b.user_id
      JOIN bet_options bo ON bo.id=b.bet_option_id
-     WHERE b.race_id=$1
-     ORDER BY b.created_at DESC`,
+     WHERE b.race_id=$1 ORDER BY b.created_at DESC`,
     [req.params.id]
   );
   res.json(r.rows);
@@ -267,7 +226,7 @@ router.get('/races/:id/bets', async (req, res) => {
 
 router.get('/users/:id/bets', async (req, res) => {
   const r = await pool.query(
-    `SELECT b.*, r.name AS race_name, bo.driver, bo.type, bo.coefficient
+    `SELECT b.*, r.name AS race_name, bo.driver
      FROM bets b
      JOIN races r ON r.id=b.race_id
      JOIN bet_options bo ON bo.id=b.bet_option_id
@@ -285,7 +244,7 @@ router.get('/users/:id/transactions', async (req, res) => {
   res.json(r.rows);
 });
 
-// ==================== PAYOUT & REVERT ====================
+// ==================== PAYOUT / REVERT ====================
 router.post('/races/:id/payout', async (req, res) => {
   const raceId = req.params.id;
   const client = await pool.connect();
@@ -293,45 +252,56 @@ router.post('/races/:id/payout', async (req, res) => {
     await client.query('BEGIN');
 
     const results = await client.query(
-      'SELECT type, driver FROM results WHERE race_id=$1',
+      'SELECT position, driver FROM results WHERE race_id=$1', [raceId]
+    );
+    if (!results.rows.length) throw new Error('Нет результатов');
+
+    // Находим выигрышные bet_options
+    const winners = await client.query(
+      `SELECT DISTINCT bo.id
+       FROM bet_options bo
+       JOIN results res ON res.race_id=bo.race_id AND res.driver=bo.driver
+       WHERE bo.race_id=$1`,
       [raceId]
     );
-    if (!results.rows.length) throw new Error('Нет результатов для этой гонки');
+    const winnerIds = winners.rows.map(r => r.id);
 
-    const winningOptions = await client.query(
-      `SELECT id FROM bet_options
-       WHERE race_id=$1 AND (type,driver) IN (SELECT type,driver FROM results WHERE race_id=$1)`,
-      [raceId]
-    );
-    const winIds = winningOptions.rows.map(r => r.id);
-
+    // Проигравшие (у которых нет выигрышного сочетания пилот+позиция)
     await client.query(
       `UPDATE bets SET status='lost'
        WHERE race_id=$1 AND status='pending'
-         AND bet_option_id <> ALL($2::uuid[])`,
-      [raceId, winIds.length ? winIds : ['00000000-0000-0000-0000-000000000000']]
+         AND NOT EXISTS (
+           SELECT 1 FROM results res
+           WHERE res.race_id=bets.race_id
+             AND res.driver=(SELECT driver FROM bet_options WHERE id=bets.bet_option_id)
+             AND res.position=bets.position
+         )`,
+      [raceId]
+    );
+
+    // Победители
+    const winningBets = await client.query(
+      `SELECT b.id, b.user_id, b.potential_payout FROM bets b
+       WHERE b.race_id=$1 AND b.status='pending'
+         AND EXISTS (
+           SELECT 1 FROM results res
+           WHERE res.race_id=b.race_id
+             AND res.driver=(SELECT driver FROM bet_options WHERE id=b.bet_option_id)
+             AND res.position=b.position
+         )`,
+      [raceId]
     );
 
     let paid = 0;
-    if (winIds.length) {
-      const winningBets = await client.query(
-        `SELECT id, user_id, potential_payout FROM bets
-         WHERE race_id=$1 AND status='pending' AND bet_option_id = ANY($2::uuid[])`,
-        [raceId, winIds]
+    for (const bet of winningBets.rows) {
+      await client.query("UPDATE bets SET status='won' WHERE id=$1", [bet.id]);
+      await client.query('UPDATE profiles SET coins=coins+$1 WHERE id=$2', [bet.potential_payout, bet.user_id]);
+      await client.query(
+        `INSERT INTO transactions (user_id, amount, type, note)
+         VALUES ($1,$2,'payout','Выигрыш по ставке')`,
+        [bet.user_id, bet.potential_payout]
       );
-      for (const bet of winningBets.rows) {
-        await client.query("UPDATE bets SET status='won' WHERE id=$1", [bet.id]);
-        await client.query(
-          'UPDATE profiles SET coins=coins+$1 WHERE id=$2',
-          [bet.potential_payout, bet.user_id]
-        );
-        await client.query(
-          `INSERT INTO transactions (user_id, amount, type, note)
-           VALUES ($1,$2,'payout','Выигрыш по ставке')`,
-          [bet.user_id, bet.potential_payout]
-        );
-        paid++;
-      }
+      paid++;
     }
 
     await client.query("UPDATE races SET status='finished' WHERE id=$1", [raceId]);
@@ -344,9 +314,7 @@ router.post('/races/:id/payout', async (req, res) => {
   } catch (e: any) {
     await client.query('ROLLBACK');
     res.status(400).json({ error: e.message });
-  } finally {
-    client.release();
-  }
+  } finally { client.release(); }
 });
 
 router.post('/races/:id/revert-payout', async (req, res) => {
@@ -365,23 +333,17 @@ router.post('/races/:id/revert-payout', async (req, res) => {
       );
     }
     await client.query(
-      "DELETE FROM transactions WHERE user_id IN (SELECT user_id FROM bets WHERE race_id=$1 AND status='won') AND type='payout' AND created_at >= (SELECT COALESCE(MIN(created_at),NOW()) FROM bets WHERE race_id=$1)",
+      "DELETE FROM transactions WHERE user_id IN (SELECT user_id FROM bets WHERE race_id=$1 AND status='won') AND type='payout'",
       [raceId]
     );
     await client.query("UPDATE bets SET status='pending' WHERE race_id=$1", [raceId]);
     await client.query("UPDATE races SET status='closed' WHERE id=$1", [raceId]);
-    await client.query(
-      `INSERT INTO admin_log (action, details) VALUES ('revert_payout', $1)`,
-      [JSON.stringify({ raceId, reverted: won.rows.length })]
-    );
     await client.query('COMMIT');
     res.json({ ok: true, reverted: won.rows.length });
   } catch (e: any) {
     await client.query('ROLLBACK');
     res.status(400).json({ error: e.message });
-  } finally {
-    client.release();
-  }
+  } finally { client.release(); }
 });
 
 // ==================== USERS ====================
@@ -398,7 +360,7 @@ router.get('/users', async (_req, res) => {
 
 router.post('/users', async (req, res) => {
   const { nickname, password } = req.body;
-  if (!nickname || !password) return res.status(400).json({ error: 'Ник и пароль обязательны' });
+  if (!nickname || !password) return res.status(400).json({ error: 'Заполни поля' });
   const bcrypt = require('bcryptjs');
   const hash = await bcrypt.hash(password, 10);
   try {
@@ -409,23 +371,19 @@ router.post('/users', async (req, res) => {
     );
     await pool.query(
       `INSERT INTO transactions (user_id, amount, type, note)
-       VALUES ($1, 200, 'signup', 'Стартовый бонус (вручную админом)')`,
+       VALUES ($1, 200, 'signup', 'Стартовый бонус')`,
       [r.rows[0].id]
     );
     res.json(r.rows[0]);
-  } catch (e: any) {
-    res.status(400).json({ error: e.message });
-  }
+  } catch (e: any) { res.status(400).json({ error: e.message }); }
 });
 
 router.patch('/users/:id', async (req, res) => {
   const { isBlocked, nickname } = req.body;
   const r = await pool.query(
     `UPDATE profiles SET
-       is_blocked=COALESCE($1,is_blocked),
-       nickname=COALESCE($2,nickname)
-     WHERE id=$3
-     RETURNING id, nickname, coins, is_blocked`,
+       is_blocked=COALESCE($1,is_blocked), nickname=COALESCE($2,nickname)
+     WHERE id=$3 RETURNING id, nickname, coins, is_blocked`,
     [isBlocked, nickname, req.params.id]
   );
   res.json(r.rows[0]);
@@ -448,24 +406,20 @@ router.post('/users/:id/reset-password', async (req, res) => {
 // ==================== GIFTS ====================
 router.post('/gift', async (req, res) => {
   const { userId, amount, note } = req.body;
-  if (!userId || !amount || amount <= 0) return res.status(400).json({ error: 'Неверные данные' });
-
+  if (!userId || !amount || amount <= 0) return res.status(400).json({ error: 'Неверно' });
   const limit = parseInt(await getSetting('monthly_gift_limit', '100000'), 10);
   const sumRes = await pool.query(
     `SELECT COALESCE(SUM(amount),0) AS total FROM transactions
-     WHERE user_id=$1 AND type='admin_gift'
-       AND created_at >= date_trunc('month', NOW())`,
+     WHERE user_id=$1 AND type='admin_gift' AND created_at >= date_trunc('month', NOW())`,
     [userId]
   );
   const given = Number(sumRes.rows[0].total);
-  if (given + amount > limit) {
-    return res.status(400).json({ error: `Лимит ${limit} в месяц. Уже выдано: ${given}` });
-  }
+  if (given + amount > limit)
+    return res.status(400).json({ error: `Лимит ${limit}. Уже выдано: ${given}` });
 
   await pool.query('UPDATE profiles SET coins=coins+$1 WHERE id=$2', [amount, userId]);
   await pool.query(
-    `INSERT INTO transactions (user_id, amount, type, note)
-     VALUES ($1,$2,'admin_gift',$3)`,
+    `INSERT INTO transactions (user_id, amount, type, note) VALUES ($1,$2,'admin_gift',$3)`,
     [userId, amount, note || 'Подарок от админа']
   );
   await pool.query(
@@ -474,34 +428,5 @@ router.post('/gift', async (req, res) => {
   );
   res.json({ ok: true });
 });
-
-// ==================== AUTO-COEF ====================
-async function calculateWinnerCoefficient(
-  driver: string,
-  currentRaceId: string,
-  client?: any
-): Promise<number> {
-  const db = client || pool;
-  const base = parseFloat(await getSetting('base_winner_coef', '10'));
-  const step = parseFloat(await getSetting('coef_decrease_step', '1'));
-  const min = parseFloat(await getSetting('min_winner_coef', '2'));
-  const threshold = parseInt(await getSetting('streak_threshold', '2'), 10);
-
-  const r = await db.query(
-    `SELECT res.driver
-     FROM races r
-     LEFT JOIN results res ON res.race_id=r.id AND res.type='winner'
-     WHERE r.race_date < (SELECT race_date FROM races WHERE id=$1)
-     ORDER BY r.race_date DESC LIMIT 10`,
-    [currentRaceId]
-  );
-  let streak = 0;
-  for (const row of r.rows) {
-    if (row.driver === driver) streak++;
-    else break;
-  }
-  if (streak <= threshold) return base;
-  return Math.max(base - (streak - threshold) * step, min);
-}
 
 export default router;
